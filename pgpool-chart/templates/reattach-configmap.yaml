@@ -1,0 +1,11 @@
+{{- if and .Values.reattach.enabled (include "pgpool.pcpEnabled" .) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgpool.fullname" . }}-reattach
+  labels:
+    {{- include "pgpool.labels" . | nindent 4 }}
+data:
+  reattach.sh: |
+{{ .Files.Get "files/reattach.sh" | indent 4 }}
+{{- end }}

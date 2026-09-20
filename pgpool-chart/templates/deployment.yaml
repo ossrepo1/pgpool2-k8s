@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgpool.fullname" . }}
+  labels:
+    {{- include "pgpool.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "pgpool.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pgpool.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: pgpool
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - pgpool
+            - -n
+            - -f
+            - /var/lib/pgpool/pgpool.conf
+            {{- if .Values.poolHba.enabled }}
+            # pool_hba.conf is not read from the pgpool.conf directory, so point at it explicitly.
+            - -a
+            - /var/lib/pgpool/pool_hba.conf
+            {{- end }}
+            {{- if include "pgpool.pcpEnabled" . }}
+            # Same for pcp.conf, which authenticates pcp_* commands such as pcp_attach_node.
+            - -F
+            - /var/lib/pgpool/pcp.conf
+            {{- end }}
+          env:
+            # Config lives in the writable emptyDir, so the root filesystem stays read-only.
+            - name: PGPOOL_CONF
+              value: /var/lib/pgpool/pgpool.conf
+            - name: PGPOOL_BACKEND_NODES
+              value: {{ include "pgpool.backendNodes" . | quote }}
+            - name: PGPOOL_BACKEND_APPLICATION_NAME
+              value: {{ .Values.backendApplicationName | quote }}
+            {{- with include "pgpool.backendApplicationNames" . }}
+            - name: PGPOOL_BACKEND_APPLICATION_NAMES
+              value: {{ . | quote }}
+            {{- end }}
+            - name: PGPOOL_ONLY_ACTIVE_NODE
+              value: {{ .Values.onlyActiveNode | quote }}
+            - name: PGPOOL_HEALTH_CHECK_TIMEOUT
+              value: {{ .Values.healthCheckTimeoutSeconds | quote }}
+            - name: PGPOOL_DETACH_FALSE_PRIMARY
+              value: {{ .Values.detachFalsePrimary | quote }}
+            - name: PGPOOL_ENABLE_POOL_HBA
+              value: {{ .Values.poolHba.enabled | quote }}
+            - name: PGPOOL_POSTGRES_USERNAME
+              value: {{ .Values.auth.username | quote }}
+            {{- if or .Values.auth.password .Values.auth.existingSecret }}
+            - name: PGPOOL_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgpool.secretName" . }}
+                  key: password
+            {{- end }}
+            {{- if include "pgpool.pcpEnabled" . }}
+            - name: PGPOOL_PCP_USERNAME
+              value: {{ .Values.pcp.username | quote }}
+            - name: PGPOOL_PCP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgpool.pcpSecretName" . }}
+                  key: pcp-password
+            {{- end }}
+          ports:
+            - name: postgres
+              containerPort: 9999
+              protocol: TCP
+            - name: pcp
+              containerPort: 9898
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: postgres
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: postgres
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgpool
+            - name: run
+              mountPath: /run/pgpool
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Ephemeral by design - pgpool holds no state that must survive a restart.
+        - name: data
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

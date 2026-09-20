@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pgpool
+description: >-
+  Stateless Pgpool-II in front of a PostgreSQL 16+ primary/standby cluster.
+  All traffic goes to the active node, the standby is monitored but idle, and
+  promotion is owned by an external HA tool (pgpool never promotes).
+type: application
+version: 0.1.0
+appVersion: "4.7.2"

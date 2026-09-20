@@ -1,0 +1,181 @@
+# Pgpool-II is deployed stateless: NO PVC is required.
+# Everything pgpool writes at runtime (backend status cache, lock files, pid file,
+# unix sockets, pool_passwd) is regenerated on start, so pods can be killed,
+# rescheduled or scaled at will. The emptyDir volumes mounted below are ephemeral
+# by design - they exist so the root filesystem can stay read-only.
+
+replicaCount: 1
+
+image:
+  # Push the image you built (see ../pgpool/Dockerfile) to your registry and point this there.
+  repository: pgpool
+  tag: "4.7.2"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# PostgreSQL nodes. At any moment exactly one of them is the active (read/write) node;
+# pgpool discovers which one by asking PostgreSQL (pg_is_in_recovery()) and sends 100%
+# of reads and writes there. When your HA tool promotes the standby, pgpool follows.
+#
+# Each standby must have its own applicationName, matching that node's application_name
+# in the PRIMARY's pg_stat_replication view - that is how pgpool maps a streaming
+# connection back to a node (backend_application_name0..N). Read it on the current
+# primary (no superuser needed, only application_name is not privilege-restricted):
+#   SELECT application_name, state, sync_state FROM pg_stat_replication;
+# Example - hknode01 primary with one HK and two SG standbys:
+#   backends:
+#     - id: 0
+#       host: hknode01
+#       port: 5432
+#     - id: 1
+#       host: hknode02
+#       port: 5432
+#       applicationName: hknode02
+#     - id: 2
+#       host: sgnode01
+#       port: 5432
+#       applicationName: sgnode01
+#     - id: 3
+#       host: sgnode02
+#       port: 5432
+#       applicationName: sgnode02
+# Two caveats: the primary entry's applicationName is never used, and never set one to a
+# pg_receivewal/barman sender (e.g. "barman_receive_wal") - it connects to every node, so
+# matching it reports that node as streaming even when its own walreceiver is dead.
+backends:
+  - id: 0
+    host: pg-node-0
+    port: 5432
+  - id: 1
+    host: pg-node-1
+    port: 5432
+    applicationName: pg-node-1
+
+# Fallback applicationName for backends entries that do not set their own. "walreceiver"
+# is the default that pg_basebackup -R produces when primary_conninfo carries no
+# application_name; one shared value only works if every standby really uses that name.
+backendApplicationName: walreceiver
+
+# load_balance_mode=off, health/streaming-replication checks on, auto_failback on and
+# failover_command/follow_primary_command empty so pgpool never promotes on its own.
+onlyActiveNode: true
+
+# Per-attempt health check timeout in seconds (0 = leave it to the OS/TCP timeout).
+# Set explicitly for a cross-region cluster: pgpool treats a *timeout* as a full
+# failover, disconnecting every client session, while a plain connection failure only
+# detaches that one node. Keep it above your worst-case RTT to the far region.
+healthCheckTimeoutSeconds: 5
+
+# Tie-breaker for the window where two nodes both report pg_is_in_recovery() = false
+# (an old primary that is up but not yet fenced or demoted). pgpool asks the standbys
+# which upstream they are streaming from (pg_stat_wal_receiver) and detaches any primary
+# that no standby follows. If no true primary is found it does nothing. Requires
+# sr_check to be running and sr_check_user in pg_monitor; with watchdog enabled only
+# the leader watchdog node performs the detach.
+detachFalsePrimary: true
+
+# Let pgpool authenticate clients itself (pool_hba.conf with scram-sha-256 backed by
+# pool_passwd). Leave false to have the PostgreSQL backends authenticate clients.
+poolHba:
+  enabled: false
+
+auth:
+  # Credentials pgpool uses for its health check / streaming replication check and to
+  # build pool_passwd. In production use a dedicated user with pg_monitor + replication:
+  # without pg_monitor (or pg_read_all_stats) pg_stat_replication returns NULL for
+  # state, sync_state and replay_lag, so every standby shows an empty replication_state
+  # and pgpool cannot measure time based replication delay.
+  username: postgres
+  password: ""
+  # Or reference an existing Secret that contains the key `password`.
+  existingSecret: ""
+
+# PCP authentication for the pcp_* commands (pcp_node_info, pcp_attach_node, ...). PCP users
+# are independent of PostgreSQL roles - they only exist for talking to pgpool. pgpool.conf
+# reads `username:md5(password)` entries from pcp.conf, written at startup. Note the md5 is
+# of the password alone, not password+user like PostgreSQL md5 auth.
+pcp:
+  username: pgpool
+  password: ""
+  # Or reference an existing Secret that contains the key `pcp-password`.
+  existingSecret: ""
+
+# Without pg_monitor, auto_failback can never fire (it needs replication_state == "streaming"),
+# so a node pgpool detached - for example after an HK<->SG network flap - stays detached until
+# something attaches it again. This job reconciles pgpool's view with reality and attaches only
+# nodes it can prove are live standbys of the current primary, using only PUBLIC functions:
+# pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_current_wal_lsn(). It never detaches,
+# never promotes, and refuses to act while the cluster state is ambiguous.
+reattach:
+  enabled: true
+  schedule: "* * * * *"
+  # A standby may be this many bytes behind and still be attached.
+  lagToleranceBytes: 1073741824
+  # Gap between the two samples used to prove the WAL receiver is actually moving.
+  sampleIntervalSeconds: 3
+  # psql connect timeout, so a black-holed peer cannot stall the job on TCP retries.
+  connectTimeoutSeconds: 5
+  activeDeadlineSeconds: 120
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+service:
+  type: ClusterIP
+  port: 9999
+  pcpPort: 9898
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 20001
+  runAsGroup: 20001
+  fsGroup: 20001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  # Runtime state goes to emptyDir volumes (see the volumes in templates/deployment.yaml).
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+probes:
+  startup:
+    failureThreshold: 30
+    periodSeconds: 2
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+
+# With replicas > 1 this keeps at least one pgpool pod serving during rollouts.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

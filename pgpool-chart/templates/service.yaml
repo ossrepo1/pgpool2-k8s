@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pgpool.fullname" . }}
+  labels:
+    {{- include "pgpool.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: postgres
+      port: {{ .Values.service.port }}
+      targetPort: postgres
+      protocol: TCP
+    - name: pcp
+      port: {{ .Values.service.pcpPort }}
+      targetPort: pcp
+      protocol: TCP
+  selector:
+    {{- include "pgpool.selectorLabels" . | nindent 4 }}

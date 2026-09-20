@@ -1,0 +1,84 @@
+{{- if and .Values.reattach.enabled (include "pgpool.pcpEnabled" .) }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pgpool.fullname" . }}-reattach
+  labels:
+    {{- include "pgpool.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.reattach.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.reattach.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "pgpool.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: reattach
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - bash
+                - /scripts/reattach.sh
+              env:
+                - name: PGPOOL_BACKEND_NODES
+                  value: {{ include "pgpool.backendNodes" . | quote }}
+                - name: PGPOOL_HOST
+                  value: {{ include "pgpool.fullname" . | quote }}
+                - name: PGPOOL_PCP_PORT
+                  value: {{ .Values.service.pcpPort | quote }}
+                - name: PCP_USER
+                  value: {{ .Values.pcp.username | quote }}
+                - name: PCP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pgpool.pcpSecretName" . }}
+                      key: pcp-password
+                - name: PCPPASSFILE
+                  value: /tmp/.pcppass
+                - name: PGUSER
+                  value: {{ .Values.auth.username | quote }}
+                {{- if or .Values.auth.password .Values.auth.existingSecret }}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pgpool.secretName" . }}
+                      key: password
+                {{- end }}
+                - name: SAMPLE_INTERVAL_SECONDS
+                  value: {{ .Values.reattach.sampleIntervalSeconds | quote }}
+                - name: LAG_TOLERANCE_BYTES
+                  value: {{ .Values.reattach.lagToleranceBytes | quote }}
+                - name: PGCONNECT_TIMEOUT
+                  value: {{ .Values.reattach.connectTimeoutSeconds | quote }}
+              resources:
+                {{- toYaml .Values.reattach.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ include "pgpool.fullname" . }}-reattach
+            - name: tmp
+              emptyDir: {}
+{{- end }}

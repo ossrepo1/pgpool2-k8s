@@ -1,0 +1,21 @@
+pgpool is deployed in namespace {{ .Release.Namespace }}.
+
+Applications connect to:
+  host: {{ include "pgpool.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  port: {{ .Values.service.port }}
+
+Check which node is currently serving traffic (all reads and writes go to it):
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "pgpool.fullname" . }} -- \
+    psql -h 127.0.0.1 -p {{ .Values.service.port }} -U {{ .Values.auth.username }} -d postgres \
+    -c "show pool_nodes"
+
+{{- if .Values.onlyActiveNode }}
+
+pgpool never promotes a node: failover_command/follow_primary_command are empty, so
+promotion stays with your HA tool. pgpool detects the dead node (health check, every
+10s), waits up to 300s for a primary to appear, and switches traffic to the standby
+once your tool promotes it.
+{{- end }}
+
+This release is stateless: no PVC, and every pod rebuilds its backend status from
+live checks on start.
