@@ -1,39 +1,48 @@
 # syntax=docker/dockerfile:1
 
-ARG DEBIAN_VERSION=trixie
+# Pgpool-II built from source on Alpine, targeting linux/amd64 so the image runs on the
+# amd64 cluster even when it is built on an arm64 workstation (emulated by the builder).
+# Run from this directory (docker-entrypoint.sh is copied from the build context):
+#
+#   docker build --platform linux/amd64 -t pgpool:4.7.2 .
+#
+# BUILD_PLATFORM defaults to linux/amd64; override for another architecture with
+# --build-arg BUILD_PLATFORM=linux/arm64.
+
+ARG BUILD_PLATFORM=linux/amd64
+
+# Alpine package mirror. dl-cdn is the official CDN but can be slow from some networks;
+# e.g. --build-arg APK_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/alpine. Applied in both
+# stages, so it also ends up in the runtime image's /etc/apk/repositories.
+ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+
 ARG PG_MAJOR=18
 ARG PGPOOL_VERSION=4.7.2
 ARG PGPOOL_SHA256=e72b9d0ff3620f7da7e33a58dda44b77919d056752dc9bd86b2985c4988d1938
 
-FROM debian:${DEBIAN_VERSION}-slim AS builder
+FROM --platform=${BUILD_PLATFORM} alpine:latest AS builder
 
+ARG APK_MIRROR
 ARG PG_MAJOR
 ARG PGPOOL_VERSION
 ARG PGPOOL_SHA256
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl; \
-    install -d /usr/share/postgresql-common/pgdg; \
-    curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-        https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
-    . /etc/os-release; \
-    printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: %s-pgdg\nComponents: main\nArchitectures: %s\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc\n' \
-        "${VERSION_CODENAME}" "$(dpkg --print-architecture)" \
-        > /etc/apt/sources.list.d/pgdg.sources; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        libpam0g-dev \
+# The apk cache mount keeps downloaded packages between builds, so an aborted or repeated
+# build does not re-download the toolchain (postgresql-dev pulls clang/llvm, ~250 MB).
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    set -eux; \
+    sed -i "s|^https://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|" /etc/apk/repositories; \
+    apk add \
+        build-base \
+        curl \
         libpq-dev \
-        libssl-dev \
-        "postgresql-server-dev-${PG_MAJOR}" \
-        zlib1g-dev; \
-    rm -rf /var/lib/apt/lists/*
-
-ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+        linux-headers \
+        linux-pam-dev \
+        openssl-dev \
+        "postgresql${PG_MAJOR}-dev" \
+        zlib-dev
 
 RUN set -eux; \
     curl -fsSL -o /tmp/pgpool.tar.gz "https://www.pgpool.net/source/pgpool-II-${PGPOOL_VERSION}.tar.gz"; \
@@ -52,48 +61,47 @@ RUN set -eux; \
     done; \
     rm -rf /tmp/pgpool /tmp/pgpool.tar.gz
 
-FROM debian:${DEBIAN_VERSION}-slim AS runtime
+FROM --platform=${BUILD_PLATFORM} alpine:latest AS runtime
 
+ARG APK_MIRROR
 ARG PG_MAJOR
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-COPY --from=builder /etc/apt/sources.list.d/pgdg.sources /etc/apt/sources.list.d/pgdg.sources
-
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        libpam0g \
-        "postgresql-client-${PG_MAJOR}" \
-        tzdata; \
-    rm -rf /var/lib/apt/lists/*
+# bash is used by docker-entrypoint.sh and the healthcheck; psql and the pcp_* clients are
+# used by the chart's reattach CronJob, which runs from this image.
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    set -eux; \
+    sed -i "s|^https://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|" /etc/apk/repositories; \
+    apk add \
+        bash \
+        ca-certificates \
+        libcrypto3 \
+        libpq \
+        libssl3 \
+        linux-pam \
+        "postgresql${PG_MAJOR}-client" \
+        tzdata
 
 COPY --from=builder /usr/local /usr/local
-COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/pgpool* /usr/share/pgpool-II/pg${PG_MAJOR}/extension/
-COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pgpool* /usr/share/pgpool-II/pg${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql${PG_MAJOR}/extension/pgpool* /usr/share/pgpool-II/pg${PG_MAJOR}/extension/
+COPY --from=builder /usr/lib/postgresql${PG_MAJOR}/pgpool* /usr/share/pgpool-II/pg${PG_MAJOR}/lib/
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN set -eux; \
     chmod 0755 /usr/local/bin/docker-entrypoint.sh; \
-    groupadd --gid 20001 pgpool; \
-    useradd --uid 20001 --gid 20001 --home-dir /var/lib/pgpool --shell /usr/sbin/nologin pgpool; \
-    install -d -o pgpool -g pgpool -m 0755 /var/lib/pgpool /run/pgpool; \
+    addgroup -g 20001 pgpool; \
+    adduser -u 20001 -G pgpool -H -D -s /sbin/nologin -h /var/lib/pgpool pgpool; \
+    mkdir -p /var/lib/pgpool /run/pgpool; \
+    chown pgpool:pgpool /var/lib/pgpool /run/pgpool; \
+    chmod 0755 /var/lib/pgpool /run/pgpool; \
     chown -R pgpool:pgpool /usr/local/etc; \
-    ldconfig; \
     if ldd /usr/local/bin/pgpool | grep -q "not found"; then \
         echo "pgpool is missing shared libraries" >&2; \
         ldd /usr/local/bin/pgpool >&2; \
         exit 1; \
     fi
-
-ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 
 USER pgpool
 WORKDIR /var/lib/pgpool
